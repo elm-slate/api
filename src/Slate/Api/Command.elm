@@ -219,7 +219,7 @@ update config msg model =
 
             CommandSuccess commandId ->
                 let
-                    cmd =
+                    msg =
                         case (getCommandState commandId).tagger of
                             CreationResult userId tagger ->
                                 tagger <| Ok userId
@@ -227,7 +227,7 @@ update config msg model =
                             OperationResult tagger ->
                                 tagger <| Ok ()
                 in
-                    ( removeCommandState model commandId ! [], [ cmd ] )
+                    ( removeCommandState model commandId ! [], [ msg ] )
 
             Validate msg ->
                 ( model ! [], [ msg ] )
