@@ -6,29 +6,36 @@ module Slate.Api.Command
         , ApiResult(..)
         , ApiCreationTagger
         , ApiOperationTagger
+        , ApiNonMutatingTagger
         , ApiCreationResultTagger
         , ApiOperationResultTagger
+        , ApiNonMutatingResultTagger
         , CustomValidationErrorHandler
         , init
         , update
-        , processMutatingEvents
+        , processCreationMutatingEvents
+        , processOperationMutatingEvents
+        , processNonMutatingEvents
+        , createEntityEvents
         , createEntity
+        , destroyEntityEvents
         , destroyEntity
+        , addPropertyEvents
         , addProperty
+        , removePropertyEvents
         , removeProperty
         )
 
 {-|
     Common Command code for creating Command APIs.
 
-@docs Config , Model , Msg , ApiResult , ApiCreationTagger , ApiOperationTagger , ApiCreationResultTagger , ApiOperationResultTagger , CustomValidationErrorHandler , init , update , processMutatingEvents , createEntity , destroyEntity , addProperty , removeProperty
+@docs Config , Model , Msg , ApiResult , ApiCreationTagger , ApiOperationTagger , ApiNonMutatingTagger , ApiCreationResultTagger , ApiOperationResultTagger , ApiNonMutatingResultTagger , CustomValidationErrorHandler , init , update , processCreationMutatingEvents , processOperationMutatingEvents , processNonMutatingEvents , createEntityEvents , createEntity , destroyEntityEvents , destroyEntity , addPropertyEvents , addProperty , removePropertyEvents , removeProperty
 -}
 
-import Task
-import Time
+import Tuple exposing (..)
 import Dict exposing (Dict)
 import Uuid
-import Random.Pcg exposing (Seed, initialSeed, step)
+import Random.Pcg as Random exposing (..)
 import StringUtils exposing (..)
 import ParentChildUpdate exposing (..)
 import Slate.Common.Db exposing (..)
@@ -52,8 +59,8 @@ type alias Config customValidationError error msg =
     , logTagger : LogTagger String msg
     , customValidationErrorHandler : CustomValidationErrorHandler customValidationError error msg
     , errorMsgToError : ErrorType -> String -> error
-    , apiNotInitialized : error
     , valueInvalid : error
+    , valuesInvalid : List PropertyName -> error
     }
 
 
@@ -69,7 +76,7 @@ type alias CommandState error msg =
 {-| Common Model
 -}
 type alias Model customValidationError error msg =
-    { seed : Maybe Seed
+    { seed : Seed
     , commandProcessorModel : CommandProcessor.Model customValidationError (Msg customValidationError msg)
     , commands : CommandDict error msg
     }
@@ -80,6 +87,7 @@ type alias Model customValidationError error msg =
 type ApiResult error msg
     = CreationResult EntityId (ApiCreationResultTagger error msg)
     | OperationResult (ApiOperationResultTagger error msg)
+    | NonMutatingResult (ApiNonMutatingResultTagger error msg)
 
 
 {-| Creation tagger result for creation Api calls (used by App).
@@ -91,6 +99,12 @@ type alias ApiCreationResultTagger error msg =
 {-| Creation tagger result for operational Api calls (used by App).
 -}
 type alias ApiOperationResultTagger error msg =
+    Result error () -> msg
+
+
+{-| Creation tagger result for operational Api calls (used by App).
+-}
+type alias ApiNonMutatingResultTagger error msg =
     Result error () -> msg
 
 
@@ -106,6 +120,12 @@ type alias ApiOperationTagger error msg =
     EntityId -> ApiOperationResultTagger error msg
 
 
+{-| Creation tagger for non-mutating Api functions (used by Api developers).
+-}
+type alias ApiNonMutatingTagger error msg =
+    () -> ApiOperationResultTagger error msg
+
+
 {-| Custom validation error handler function signature
 -}
 type alias CustomValidationErrorHandler customValidationError error msg =
@@ -114,7 +134,7 @@ type alias CustomValidationErrorHandler customValidationError error msg =
 
 commandProcessorConfig : CommandProcessor.Config customValidationError (Msg customValidationError msg)
 commandProcessorConfig =
-    { routeToMeTagger = CommandProcessorModule
+    { routeToMeTagger = CommandProcessorMsg
     , errorTagger = CommandProcessorError
     , logTagger = CommandProcessorLog
     , commandErrorTagger = CommandError
@@ -122,17 +142,17 @@ commandProcessorConfig =
     }
 
 
-initModel : ( Model customValidationError error msg, List (Cmd (Msg customValidationError msg)) )
-initModel =
+initModel : Seed -> ( Model customValidationError error msg, List (Cmd (Msg customValidationError msg)) )
+initModel initialSeed =
     let
         ( commandProcessorModel, commandProcessorCmd ) =
             CommandProcessor.init commandProcessorConfig
     in
-        ( { seed = Nothing
+        ( { seed = initialSeed
           , commands = Dict.empty
           , commandProcessorModel = commandProcessorModel
           }
-        , [ commandProcessorCmd, Time.now |> Task.perform InitSeed ]
+        , [ commandProcessorCmd ]
         )
 
 
@@ -142,11 +162,11 @@ initModel =
 
 {-| Initialize API
 -}
-init : Config customValidationError error msg -> ( Model customValidationError error msg, Cmd msg )
-init config =
+init : Config customValidationError error msg -> Seed -> ( Model customValidationError error msg, Cmd msg )
+init config initialSeed =
     let
         ( model, cmds ) =
-            initModel
+            initModel initialSeed
     in
         model ! (List.map (Cmd.map config.routeToMeTagger) cmds)
 
@@ -154,8 +174,7 @@ init config =
 {-| Command Processor's Msg
 -}
 type Msg customValidationError msg
-    = InitSeed Float
-    | CommandProcessorModule (CommandProcessor.Msg customValidationError)
+    = CommandProcessorMsg (CommandProcessor.Msg customValidationError)
     | CommandProcessorLog ( LogLevel, ( CommandId, String ) )
     | CommandProcessorError ( ErrorType, ( CommandId, String ) )
     | CommandError ( CommandId, CommandError customValidationError )
@@ -186,18 +205,18 @@ update config msg model =
                     OperationResult tagger ->
                         tagger error
 
+                    NonMutatingResult tagger ->
+                        tagger error
+
         updateCommandProcessor =
-            updateChildParent (CommandProcessor.update commandProcessorConfig) (update config) .commandProcessorModel CommandProcessorModule (\model commandProcessorModel -> { model | commandProcessorModel = commandProcessorModel })
+            updateChildParent (CommandProcessor.update commandProcessorConfig) (update config) .commandProcessorModel CommandProcessorMsg (\model commandProcessorModel -> { model | commandProcessorModel = commandProcessorModel })
     in
         case msg of
-            InitSeed time ->
-                ( { model | seed = Just <| initialSeed <| round time } ! [], [] )
-
-            CommandProcessorModule msg ->
+            CommandProcessorMsg msg ->
                 updateCommandProcessor msg model
 
             CommandProcessorLog ( logLevel, details ) ->
-                ( model ! [], [ config.logTagger <| ( logLevel, "CommandProcessor:" +-+ details ) ] )
+                ( model ! [], [ config.logTagger ( logLevel, "CommandProcessor:" +-+ details ) ] )
 
             CommandProcessorError ( errorType, ( commandId, details ) ) ->
                 ( removeCommandState model commandId ! [], [ errorMsgToApiError commandId errorType ("CommandProcessor:" +-+ details) ] )
@@ -221,10 +240,13 @@ update config msg model =
                 let
                     msg =
                         case (getCommandState commandId).tagger of
-                            CreationResult userId tagger ->
-                                tagger <| Ok userId
+                            CreationResult entityId tagger ->
+                                tagger <| Ok entityId
 
                             OperationResult tagger ->
+                                tagger <| Ok ()
+
+                            NonMutatingResult tagger ->
                                 tagger <| Ok ()
                 in
                     ( removeCommandState model commandId ! [], [ msg ] )
@@ -233,100 +255,141 @@ update config msg model =
                 ( model ! [], [ msg ] )
 
 
-{-| Process operational mutating events (not creation).
+{-| Process creation mutating events.
 -}
-processMutatingEvents : List MutatingEvent -> String -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiOperationTagger error msg -> EntityId -> ( Model customValidationError error msg, Cmd msg )
-processMutatingEvents mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId =
-    let
-        ( entityValidations, encodedEvents ) =
-            prepareCommand initiatorId commandName mutatingEvents
+processCreationMutatingEvents : List MutatingEvent -> String -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiCreationTagger id error msg -> EntityId -> id -> ( Model customValidationError error msg, Cmd msg )
+processCreationMutatingEvents mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId id =
+    prepareCommand mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model <| CreationResult entityId <| tagger id
 
-        ( newCommandProcessorModel, cmd, commandId ) =
-            CommandProcessor.process commandProcessorConfig dbConnectionInfo maybeValidation entityValidations encodedEvents model.commandProcessorModel
-    in
-        ( { model | commandProcessorModel = newCommandProcessorModel, commands = Dict.insert commandId (CommandState <| OperationResult <| tagger entityId) model.commands }, Cmd.map config.routeToMeTagger cmd )
+
+{-| Process operational mutating events.
+-}
+processOperationMutatingEvents : List MutatingEvent -> String -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiOperationTagger error msg -> EntityId -> ( Model customValidationError error msg, Cmd msg )
+processOperationMutatingEvents mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId =
+    prepareCommand mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model (OperationResult <| tagger entityId)
+
+
+{-| Process non-mutating events.
+-}
+processNonMutatingEvents : List Value -> String -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiNonMutatingTagger error msg -> ( Model customValidationError error msg, Cmd msg )
+processNonMutatingEvents nonMutatingEvents commandName config dbConnectionInfo initiatorId model tagger =
+    prepareNonMutatingCommand nonMutatingEvents commandName config dbConnectionInfo initiatorId model (NonMutatingResult <| tagger ())
+
+
+{-| Create an entity events
+-}
+createEntityEvents : String -> List ( PropertyName, Value ) -> Config customValidationError error msg -> Model customValidationError error msg -> Result error ( Model customValidationError error msg, EntityId, List MutatingEvent )
+createEntityEvents entityName additionProperties config model =
+    step Uuid.uuidGenerator model.seed
+        |> (\( uuid, newSeed ) ->
+                { model | seed = newSeed }
+                    |> (\model ->
+                            let
+                                entityId =
+                                    Uuid.toString uuid
+
+                                mutatingEvents =
+                                    [ CreateEntity entityName entityId ]
+                                        |> (flip List.append <| List.map (\( name, value ) -> AddProperty entityName entityId name value) additionProperties)
+                            in
+                                additionProperties
+                                    |> List.filter (((==) "") << second)
+                                    |> List.map first
+                                    |> (\badPropertyNames -> (List.length badPropertyNames == 0) ? ( Ok ( model, entityId, mutatingEvents ), Err <| config.valuesInvalid badPropertyNames ))
+                       )
+           )
 
 
 {-| Create an entity
 -}
-createEntity : String -> String -> List ( PropertyName, Value ) -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiCreationTagger Value error msg -> String -> Result error ( Model customValidationError error msg, Cmd msg )
-createEntity entityName commandName additionProperties maybeValidation config dbConnectionInfo initiatorId model tagger value =
-    model.seed
-        |?> (\seed ->
-                let
-                    ( uuid, newSeed ) =
-                        step Uuid.uuidGenerator seed
+createEntity : String -> String -> List ( PropertyName, Value ) -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiCreationTagger id error msg -> id -> Result error ( Model customValidationError error msg, Cmd msg )
+createEntity entityName commandName additionProperties maybeValidation config dbConnectionInfo initiatorId model tagger id =
+    createEntityEvents entityName additionProperties config model
+        |??> (\( model, entityId, mutatingEvents ) -> Ok <| processCreationMutatingEvents mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId id)
+        ??= Err
 
-                    newModel =
-                        { model | seed = Just newSeed }
 
-                    entityId =
-                        Uuid.toString uuid
-
-                    mutatingEvents =
-                        [ CreateEntity entityName entityId ]
-                            |> (flip List.append <| List.map (\( name, value ) -> AddProperty entityName entityId name value) additionProperties)
-
-                    ( entityValidations, encodedEvents ) =
-                        prepareCommand initiatorId commandName mutatingEvents
-
-                    ( commandProcessorModel, cmd, commandId ) =
-                        CommandProcessor.process commandProcessorConfig dbConnectionInfo maybeValidation entityValidations encodedEvents newModel.commandProcessorModel
-                in
-                    Ok ( { newModel | commandProcessorModel = commandProcessorModel, commands = Dict.insert commandId (CommandState <| CreationResult entityId <| tagger value) newModel.commands }, Cmd.map config.routeToMeTagger cmd )
-            )
-        ?= Err config.apiNotInitialized
+{-| Destroy entity events
+-}
+destroyEntityEvents : String -> EntityId -> List MutatingEvent
+destroyEntityEvents entityName entityId =
+    [ DestroyEntity entityName entityId ]
 
 
 {-| Destroy entity.
 -}
-destroyEntity : String -> String -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiOperationTagger error msg -> EntityId -> ( Model customValidationError error msg, Cmd msg )
-destroyEntity entityName commandName config dbConnectionInfo initiatorId model tagger entityId =
-    let
-        mutatingEvents =
-            [ DestroyEntity entityName entityId
-            ]
+destroyEntity : String -> String -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiOperationTagger error msg -> EntityId -> ( Model customValidationError error msg, Cmd msg )
+destroyEntity entityName commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId =
+    processOperationMutatingEvents (destroyEntityEvents entityName entityId) commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId
 
-        ( entityValidations, encodedEvents ) =
-            prepareCommand initiatorId commandName mutatingEvents
 
-        ( commandProcessorModel, cmd, commandId ) =
-            CommandProcessor.process commandProcessorConfig dbConnectionInfo Nothing entityValidations encodedEvents model.commandProcessorModel
-    in
-        ( { model | commandProcessorModel = commandProcessorModel, commands = Dict.insert commandId (CommandState <| OperationResult <| tagger entityId) model.commands }, Cmd.map config.routeToMeTagger cmd )
+{-| Add property events
+-}
+addPropertyEvents : String -> EntityId -> PropertyName -> Value -> Config customValidationError error msg -> Result error (List MutatingEvent)
+addPropertyEvents entityName entityId propertyName value config =
+    (value /= "") ? ( Ok [ AddProperty entityName entityId propertyName value ], Err config.valueInvalid )
 
 
 {-| Add property.
 -}
 addProperty : String -> String -> PropertyName -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiOperationTagger error msg -> EntityId -> Value -> Result error ( Model customValidationError error msg, Cmd msg )
 addProperty entityName commandName propertyName maybeValidation config dbConnectionInfo initiatorId model tagger entityId value =
-    (value /= "") ? ( Ok <| processMutatingEvents [ AddProperty entityName entityId propertyName value ] commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId, Err config.valueInvalid )
+    addPropertyEvents entityName entityId propertyName value config
+        |??> (\mutatingEvents -> Ok <| processOperationMutatingEvents mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId)
+        ??= Err
+
+
+{-| Remove property events
+-}
+removePropertyEvents : String -> EntityId -> PropertyName -> List MutatingEvent
+removePropertyEvents entityName entityId propertyName =
+    [ RemoveProperty entityName entityId propertyName ]
 
 
 {-| Remove property.
 -}
 removeProperty : String -> String -> PropertyName -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiOperationTagger error msg -> EntityId -> ( Model customValidationError error msg, Cmd msg )
 removeProperty entityName commandName propertyName maybeValidation config dbConnectionInfo initiatorId model tagger entityId =
-    processMutatingEvents [ RemoveProperty entityName entityId propertyName ] commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId
+    processOperationMutatingEvents (removePropertyEvents entityName entityId propertyName) commandName maybeValidation config dbConnectionInfo initiatorId model tagger entityId
 
 
 
 -- PRIVATE API
 
 
-prepareCommand : InitiatorId -> String -> List MutatingEvent -> ( List EntityLockAndValidation, List String )
-prepareCommand initiatorId command mutatingEvents =
+prepareCommand : List MutatingEvent -> String -> Maybe (ValidateTagger (CommandProcessor.Msg customValidationError) customValidationError (Msg customValidationError msg)) -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiResult error msg -> ( Model customValidationError error msg, Cmd msg )
+prepareCommand mutatingEvents commandName maybeValidation config dbConnectionInfo initiatorId model apiResult =
     let
-        toEvent : Metadata -> MutatingEvent -> Event
         toEvent metadata mutatingEvent =
             Mutating mutatingEvent metadata
 
         metadata =
-            Metadata initiatorId command
+            Metadata initiatorId commandName
 
         ( entityValidations, encodedEvents ) =
             ( mutatingEvents |> List.map (\mutatingEvent -> (LockAndValidate << ValidateForMutation <| toEvent metadata mutatingEvent))
-            , mutatingEvents |> List.map (encodeMutatingEvent << (toEvent metadata))
+            , mutatingEvents |> List.map (encodeEvent << (toEvent metadata))
             )
+
+        ( newCommandProcessorModel, cmd, commandId ) =
+            CommandProcessor.process commandProcessorConfig dbConnectionInfo maybeValidation entityValidations encodedEvents model.commandProcessorModel
     in
-        ( entityValidations, encodedEvents )
+        ( { model | commandProcessorModel = newCommandProcessorModel, commands = Dict.insert commandId (CommandState <| apiResult) model.commands }, Cmd.map config.routeToMeTagger cmd )
+
+
+prepareNonMutatingCommand : List Value -> String -> Config customValidationError error msg -> DbConnectionInfo -> InitiatorId -> Model customValidationError error msg -> ApiResult error msg -> ( Model customValidationError error msg, Cmd msg )
+prepareNonMutatingCommand nonMutatingEvents commandName config dbConnectionInfo initiatorId model apiResult =
+    let
+        toEvent metadata value =
+            NonMutating value metadata
+
+        metadata =
+            Metadata initiatorId commandName
+
+        ( entityValidations, encodedEvents ) =
+            ( [], nonMutatingEvents |> List.map (encodeEvent << (toEvent metadata)) )
+
+        ( newCommandProcessorModel, cmd, commandId ) =
+            CommandProcessor.process commandProcessorConfig dbConnectionInfo Nothing entityValidations encodedEvents model.commandProcessorModel
+    in
+        ( { model | commandProcessorModel = newCommandProcessorModel, commands = Dict.insert commandId (CommandState <| apiResult) model.commands }, Cmd.map config.routeToMeTagger cmd )
