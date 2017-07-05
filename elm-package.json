@@ -1,5 +1,5 @@
 {
-    "version": "3.0.0",
+    "version": "3.0.1",
     "summary": "Slate Command and Query code for creating APIs",
     "repository": "https://github.com/elm-slate/api.git",
     "license": "Unlicense",
@@ -23,7 +23,7 @@
         "panosoft/elm-parent-child-update": "2.0.0 <= v < 3.0.0",
         "elm-slate/common": "3.0.0 <= v < 4.0.0",
         "elm-slate/command": "2.0.0 <= v < 3.0.0",
-        "elm-slate/query": "2.0.0 <= v < 3.0.0",
+        "elm-slate/query": "3.0.0 <= v < 4.0.0",
         "panosoft/elm-event-emitter": "2.0.0 <= v < 3.0.0",
         "elm-slate/dbwatcher": "1.0.0 <= v < 2.0.0"
     },
