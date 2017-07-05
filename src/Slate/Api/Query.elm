@@ -1,6 +1,7 @@
 module Slate.Api.Query
     exposing
         ( Config
+        , WrappedConfig
         , Model
         , Msg(..)
         , QueryError
@@ -11,9 +12,15 @@ module Slate.Api.Query
         , ApiQueryResultTagger
         , FetchFunctionReturn
         , FetchAndWatchFunctionReturn
+        , PersistedState
+        , unwrapConfig
         , init
         , start
         , stop
+        , persistedStateEncoder
+        , persistedStateDecoder
+        , load
+        , save
         , update
         , subscriptions
         , queryComplete
@@ -32,19 +39,25 @@ module Slate.Api.Query
 {-|
     Common Query code for creating Query APIs.
 
-@docs Config, Model, Msg, QueryError, QueryResult, ExecutionId, ApiExecutionState, ApiQueryState, ApiQueryResultTagger, FetchFunctionReturn, FetchAndWatchFunctionReturn, init, start, stop, update, subscriptions, queryComplete, getQueryState, setQueryState, getCurrentExecutionId, getCurrentExecutionState, getCurrentMutationState, setCurrentMutationState, fetch, fetchAndWatch, unwatch, unwatchAll
+@docs Config, WrappedConfig, Model, Msg, QueryError, QueryResult, ExecutionId, ApiExecutionState, ApiQueryState, ApiQueryResultTagger, FetchFunctionReturn, FetchAndWatchFunctionReturn, PersistedState, unwrapConfig, init, start, stop, persistedStateEncoder, persistedStateDecoder, load, save, update, subscriptions, queryComplete, getQueryState, setQueryState, getCurrentExecutionId, getCurrentExecutionState, getCurrentMutationState, setCurrentMutationState, fetch, fetchAndWatch, unwatch, unwatchAll
 -}
 
+import Tuple exposing (..)
 import Time exposing (Time)
 import Task
 import Process
 import Dict as Dict exposing (Dict)
+import Json.Decode as JD exposing (field)
+import Json.Encode as JE
+import Utils.Json as Json exposing ((///), (<||))
 import Maybe.Extra as Maybe
 import List.Extra as List
+import Result.Extra as Result
 import StringUtils exposing (..)
 import Slate.Common.Db exposing (..)
 import Slate.Common.Event exposing (..)
 import Slate.Common.Entity exposing (..)
+import Slate.Common.StateMachine exposing (..)
 import Slate.Engine.Query as Query exposing (..)
 import Slate.Engine.Engine as Engine exposing (..)
 import Slate.Common.Taggers exposing (..)
@@ -70,10 +83,6 @@ type alias ApiExecutionState mutationState =
     }
 
 
-type alias ExecutionStates mutationState =
-    Dict ExecutionId (ApiExecutionState mutationState)
-
-
 {-| Query Error.
 -}
 type alias QueryError =
@@ -85,7 +94,7 @@ type alias QueryError =
 type alias ApiQueryState mutationState =
     { persist : Bool
     , currentExecutionId : Maybe ExecutionId
-    , executionStates : ExecutionStates mutationState
+    , executionStates : Dict ExecutionId (ApiExecutionState mutationState)
     , maybeError : Maybe QueryError
     }
 
@@ -93,7 +102,9 @@ type alias ApiQueryState mutationState =
 {-| Module's config
 -}
 type alias Config mutation mutationState completionTagger msg =
-    { routeToMeTagger : Msg mutation completionTagger -> msg
+    { ownerPath : String
+    , connectionRetryMax : Int
+    , routeToMeTagger : Msg mutation completionTagger -> msg
     , dbWatcherReconnectDelayInterval : Time
     , dbWatcherStopDelayInterval : Time
     , returnCmds : List (Cmd msg) -> msg
@@ -101,9 +112,25 @@ type alias Config mutation mutationState completionTagger msg =
     , errorTagger : ErrorTagger String msg
     , onError : completionTagger -> QueryError -> msg
     , onComplete : ApiExecutionState mutationState -> completionTagger -> Maybe (List PropertyName) -> msg
-    , onMutate : Model mutation mutationState completionTagger msg -> QueryId -> mutation -> ( ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) ), List msg )
+    , onMutate : WrappedConfig mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> mutation -> ( ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) ), List msg )
+    , queryBatchSize : Int
     , debug : Bool
     }
+
+
+{-| helper to unwrap config
+-}
+unwrapConfig : WrappedConfig mutation mutationState completionTagger msg -> Config mutation mutationState completionTagger msg
+unwrapConfig wrappedConfig =
+    case wrappedConfig of
+        WrappedConfig config ->
+            config
+
+
+{-| Wrapped Config to avoid circular alias definition
+-}
+type WrappedConfig mutation mutationState completionTagger msg
+    = WrappedConfig (Config mutation mutationState completionTagger msg)
 
 
 {-| Query Result
@@ -136,39 +163,66 @@ type FetchOperation mutation mutationState completionTagger msg
     = Fetch (FetchFunction mutation mutationState completionTagger msg)
 
 
-type alias ApiName =
-    String
-
-
 type alias Watch mutation mutationState completionTagger msg =
-    ( msg, ApiName, FetchOperation mutation mutationState completionTagger msg, completionTagger )
+    ( msg, FetchOperation mutation mutationState completionTagger msg, completionTagger )
+
+
+type RunningState
+    = InitState
+    | LoadState
+    | StartState
+    | SaveState
+    | StopState
+
+
+stateMachine : StateMachine RunningState
+stateMachine =
+    validateStateMachine
+        { makeComparable = toString
+        , initialStates = [ InitState ]
+        , edges =
+            [ ( InitState, StartState )
+            , ( InitState, LoadState )
+            , ( LoadState, StartState )
+            , ( StartState, StopState )
+            , ( StartState, SaveState )
+            , ( SaveState, SaveState )
+            , ( SaveState, StopState )
+            ]
+        , terminalStates = [ StopState ]
+        }
+
+
+type alias ApiCallName =
+    String
 
 
 {-| Modules model
 -}
 type alias Model mutation mutationState completionTagger msg =
-    { fullyQualifiedModuleName : String
+    { runningState : RunningState
     , nextExecutionId : Int
     , queryStates : Dict QueryId (ApiQueryState mutationState)
     , engineModel : Engine.Model (Msg mutation completionTagger)
     , dbWatcherModel : DbWatcher.Model
-    , persitentQueryIds : Dict String QueryId
+    , persistentQueryIds : Dict ApiCallName QueryId
     , watches : Dict QueryId (List (Watch mutation mutationState completionTagger msg))
     , refetchQueryId : Maybe QueryId
-    , started : Bool
     , dbConnectionInfo : Maybe DbConnectionInfo
+    , persistedEngineQueries : Maybe (Dict ApiCallName String)
     }
 
 
 engineConfig : Config mutation mutationState completionTagger msg -> Engine.Config (Msg mutation completionTagger)
 engineConfig config =
     { debug = config.debug
+    , connectionRetryMax = config.connectionRetryMax
     , logTagger = EngineLog
     , errorTagger = EngineError
     , eventProcessingErrorTagger = EventProcessingError
     , completionTagger = EventProcessingComplete
     , routeToMeTagger = EngineMsg
-    , queryBatchSize = 2000
+    , queryBatchSize = config.queryBatchSize
     }
 
 
@@ -184,12 +238,16 @@ dbWatcherConfig config =
     }
 
 
+enforceState : RunningState -> Model mutation mutationState completionTagger msg -> Result String (Model mutation mutationState completionTagger msg)
+enforceState newState model =
+    validateTransition stateMachine (Just model.runningState) newState
+        |??> (\_ -> { model | runningState = newState })
+
+
 initModel :
     Config mutation mutationState completionTagger msg
-    -> DbConnectionInfo
-    -> String
     -> ( Model mutation mutationState completionTagger msg, List (Cmd (Msg mutation completionTagger)) )
-initModel config dbConnectionInfo fullyQualifiedModuleName =
+initModel config =
     let
         ( engineModel, engineCmd ) =
             Engine.init (engineConfig config)
@@ -197,16 +255,16 @@ initModel config dbConnectionInfo fullyQualifiedModuleName =
         ( dbWatcherModel, dbWatcherCmd ) =
             DbWatcher.init (dbWatcherConfig config)
     in
-        ( { fullyQualifiedModuleName = fullyQualifiedModuleName
+        ( { runningState = InitState
           , nextExecutionId = 0
           , queryStates = Dict.empty
           , engineModel = engineModel
           , dbWatcherModel = dbWatcherModel
-          , persitentQueryIds = Dict.empty
+          , persistentQueryIds = Dict.empty
           , watches = Dict.empty
           , refetchQueryId = Nothing
-          , started = False
           , dbConnectionInfo = Nothing
+          , persistedEngineQueries = Nothing
           }
         , [ engineCmd, dbWatcherCmd ]
         )
@@ -214,11 +272,11 @@ initModel config dbConnectionInfo fullyQualifiedModuleName =
 
 {-| Initialize command processor
 -}
-init : Config mutation mutationState completionTagger msg -> DbConnectionInfo -> String -> ( Model mutation mutationState completionTagger msg, Cmd msg )
-init config dbConnectionInfo fullyQualifiedModuleName =
+init : Config mutation mutationState completionTagger msg -> ( Model mutation mutationState completionTagger msg, Cmd msg )
+init config =
     let
         ( model, cmds ) =
-            initModel config dbConnectionInfo fullyQualifiedModuleName
+            initModel config
     in
         model ! (List.map (Cmd.map config.routeToMeTagger) cmds)
 
@@ -231,11 +289,13 @@ start :
     -> Model mutation mutationState completionTagger msg
     -> Result String ( Model mutation mutationState completionTagger msg, Cmd msg )
 start config dbConnectionInfo model =
-    not model.started
-        ? ( DbWatcher.start (dbWatcherConfig config) model.dbWatcherModel [ dbConnectionInfo ]
-                |> (\( dbWatcherModel, dbWatcherCmd ) -> Ok <| { model | started = True, dbConnectionInfo = Just dbConnectionInfo, dbWatcherModel = dbWatcherModel } ! [ Cmd.map config.routeToMeTagger dbWatcherCmd ])
-          , (Err "Already Started")
-          )
+    enforceState StartState model
+        |??>
+            (\model ->
+                DbWatcher.start (dbWatcherConfig config) model.dbWatcherModel [ dbConnectionInfo ]
+                    |> (\( dbWatcherModel, dbWatcherCmd ) -> Ok <| { model | dbConnectionInfo = Just dbConnectionInfo, dbWatcherModel = dbWatcherModel } ! [ Cmd.map config.routeToMeTagger dbWatcherCmd ])
+            )
+        ??= Err
 
 
 {-| Stop API
@@ -243,18 +303,139 @@ start config dbConnectionInfo model =
 stop :
     Config mutation mutationState completionTagger msg
     -> Model mutation mutationState completionTagger msg
-    -> ApiName
     -> Result String ( Model mutation mutationState completionTagger msg, Cmd msg )
-stop config model apiName =
-    (unwatchAll config model apiName)
-        |> (\( model, unwatchAllCmd ) ->
-                (model.started
-                    ? ( DbWatcher.stop (dbWatcherConfig config) model.dbWatcherModel
-                            |> (\( dbWatcherModel, dbWatcherCmd ) -> Ok <| { model | started = False, dbConnectionInfo = Nothing, dbWatcherModel = dbWatcherModel } ! [ Cmd.map config.routeToMeTagger dbWatcherCmd, unwatchAllCmd ])
-                      , Err "Not started"
-                      )
+stop config model =
+    enforceState StopState model
+        |??>
+            (\model ->
+                unwatchAll config model
+                    |> (\( model, unwatchAllCmd ) ->
+                            DbWatcher.stop (dbWatcherConfig config) model.dbWatcherModel
+                                |> (\( dbWatcherModel, dbWatcherCmd ) -> Ok <| { model | dbConnectionInfo = Nothing, dbWatcherModel = dbWatcherModel } ! [ Cmd.map config.routeToMeTagger dbWatcherCmd, unwatchAllCmd ])
+                       )
+            )
+        ??= Err
+
+
+{-| persisted state
+-}
+type alias PersistedState mutationState =
+    { engineQueries : Dict ApiCallName String
+    , apiQueryStates : Dict QueryId (ApiQueryState mutationState)
+    }
+
+
+executionStateEncoder : (mutationState -> JE.Value) -> ApiExecutionState mutationState -> JE.Value
+executionStateEncoder mutationStateEncoder executionState =
+    JE.object
+        [ ( "executionCount", JE.int executionState.executionCount )
+        , ( "mutationState", mutationStateEncoder executionState.mutationState )
+        ]
+
+
+queryStateEncoder : (mutationState -> JE.Value) -> ApiQueryState mutationState -> JE.Value
+queryStateEncoder mutationStateEncoder queryState =
+    JE.object
+        [ ( "persist", JE.bool queryState.persist )
+        , ( "currentExecutionId", Json.encMaybe JE.string queryState.currentExecutionId )
+        , ( "executionStates", Json.encDict JE.string (executionStateEncoder mutationStateEncoder) queryState.executionStates )
+        , ( "maybeError"
+          , Json.encMaybe
+                (\maybeError ->
+                    JE.object
+                        [ ( "first", errorTypeEncoder (first maybeError) )
+                        , ( "second", JE.string (second maybeError) )
+                        ]
                 )
-           )
+                queryState.maybeError
+          )
+        ]
+
+
+{-| PersistedState encoder
+-}
+persistedStateEncoder : (mutationState -> JE.Value) -> PersistedState mutationState -> JE.Value
+persistedStateEncoder mutationStateEncoder persistedState =
+    JE.object
+        [ ( "engineQueries", Json.encDict JE.string JE.string persistedState.engineQueries )
+        , ( "apiQueryStates", Json.encDict JE.int (queryStateEncoder mutationStateEncoder) persistedState.apiQueryStates )
+        ]
+
+
+executionStateDecoder : JD.Decoder mutationState -> JD.Decoder (ApiExecutionState mutationState)
+executionStateDecoder mutationStateDecoder =
+    (JD.succeed <| ApiExecutionState)
+        <|| (field "executionCount" JD.int)
+        <|| (field "mutationState" mutationStateDecoder)
+
+
+queryStateDecoder : JD.Decoder mutationState -> JD.Decoder (ApiQueryState mutationState)
+queryStateDecoder mutationStateDecoder =
+    (JD.succeed ApiQueryState)
+        <|| (field "persist" JD.bool)
+        <|| (JD.maybe (field "currentExecutionId" JD.string))
+        <|| (field "executionStates" <| Json.decDict JD.string (executionStateDecoder mutationStateDecoder))
+        <|| (JD.maybe
+                (field "maybeError" <|
+                    (JD.succeed (,))
+                        <|| (field "first" errorTypeDecoder)
+                        <|| (field "second" JD.string)
+                )
+            )
+
+
+{-| PersistedState decoder
+-}
+persistedStateDecoder : JD.Decoder mutationState -> JD.Decoder (PersistedState mutationState)
+persistedStateDecoder mutationStateDecoder =
+    (JD.succeed PersistedState)
+        <|| (field "engineQueries" <| Json.decDict JD.string JD.string)
+        <|| (field "apiQueryStates" <| Json.decDict JD.int (queryStateDecoder mutationStateDecoder))
+
+
+{-| Load persisted state
+-}
+load :
+    Config mutation mutationState completionTagger msg
+    -> Model mutation mutationState completionTagger msg
+    -> PersistedState mutationState
+    -> Result String (Model mutation mutationState completionTagger msg)
+load config model persistedState =
+    enforceState LoadState model
+        |??> (\model -> Ok { model | persistedEngineQueries = Just persistedState.engineQueries })
+        ??= Err
+
+
+{-| Save persisted state
+-}
+save :
+    Config mutation mutationState completionTagger msg
+    -> Model mutation mutationState completionTagger msg
+    -> Result String ( Model mutation mutationState completionTagger msg, PersistedState mutationState )
+save config model =
+    enforceState SaveState model
+        |??>
+            (\model ->
+                (model.persistentQueryIds
+                    |> Dict.filter (\_ -> Engine.isGoodQueryState model.engineModel)
+                    |> Dict.map (\_ -> Engine.exportQueryState model.engineModel)
+                    |> (\dict ->
+                            (dict |> Dict.filter (\_ -> Result.isErr))
+                                |> (\dictErrors ->
+                                        model.queryStates
+                                            |> Dict.filter (\_ -> .persist)
+                                            |> Dict.map (\_ queryState -> { queryState | executionStates = Dict.map (\_ state -> { state | executionCount = 0 }) queryState.executionStates, currentExecutionId = Nothing, maybeError = Nothing })
+                                            |> (\apiQueryStates ->
+                                                    (Dict.size dictErrors == 0)
+                                                        ? ( Ok <| ( model, { engineQueries = Dict.map (\_ -> (flip (??=)) (always "")) dict, apiQueryStates = apiQueryStates } )
+                                                          , Err <| ((List.map ((flip (??=)) (always "")) <| Dict.values dictErrors) |> String.join "\n")
+                                                          )
+                                               )
+                                   )
+                       )
+                )
+            )
+        ??= Err
 
 
 isWatched : Model mutation mutationState completionTagger msg -> QueryId -> Bool
@@ -262,34 +443,36 @@ isWatched model queryId =
     Dict.member queryId model.watches
 
 
-disposeQuery : Model mutation mutationState completionTagger msg -> QueryId -> Model mutation mutationState completionTagger msg
-disposeQuery model queryId =
+disposeQuery : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> Model mutation mutationState completionTagger msg
+disposeQuery config model queryId =
     let
         queryState =
-            getQueryState queryId model
+            getQueryState config model queryId
     in
-        (queryState.persist || isWatched model queryId) ? ( model, { model | engineModel = Engine.disposeQuery model.engineModel queryId, queryStates = Dict.remove queryId model.queryStates } )
+        (queryState.persist || isWatched model queryId)
+            ? ( model, { model | engineModel = Engine.disposeQuery model.engineModel queryId, queryStates = Dict.remove queryId model.queryStates } )
 
 
-countDownExecution : Model mutation mutationState completionTagger msg -> QueryId -> ExecutionId -> Model mutation mutationState completionTagger msg
-countDownExecution model queryId executionId =
+countDownExecution : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> ExecutionId -> Model mutation mutationState completionTagger msg
+countDownExecution config model queryId executionId =
     let
         executionState =
-            getExecutionState queryId executionId model
+            getExecutionState config model queryId executionId
 
         queryState =
-            getQueryState queryId model
+            getQueryState config model queryId
     in
         queryState.persist
-            ? ( let
-                    executionCount =
-                        executionState.executionCount - 1
-                in
-                    (executionCount == 0)
-                        ? ( setQueryState queryId model { queryState | executionStates = Dict.remove executionId queryState.executionStates }
-                          , setExecutionState queryId executionId model { executionState | executionCount = executionCount }
-                          )
-              , disposeQuery model queryId
+            ? ( setExecutionState config model queryId executionId { executionState | executionCount = executionState.executionCount - 1 }
+                -- let
+                --         executionCount =
+                --             executionState.executionCount - 1
+                --     in
+                --      (executionCount == 0)
+                --     ? ( setQueryState queryId model { queryState | executionStates = Dict.remove executionId queryState.executionStates }
+                --       , setExecutionState config model queryId executionId { executionState | executionCount = executionCount }
+                --       )
+              , disposeQuery config model queryId
               )
 
 
@@ -298,23 +481,23 @@ getMaybeQueryState queryId model =
     Dict.get queryId model.queryStates
 
 
-getExecutionState : QueryId -> ExecutionId -> Model mutation mutationState completionTagger msg -> ApiExecutionState mutationState
-getExecutionState queryId executionId model =
+getExecutionState : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> ExecutionId -> ApiExecutionState mutationState
+getExecutionState config model queryId executionId =
     let
         queryState =
-            getQueryState queryId model
+            getQueryState config model queryId
     in
-        Dict.get executionId queryState.executionStates ?!= (\_ -> Debug.crash ("Cannot get executionState for queryId:" +-+ queryId +-+ "executionId:" +-+ executionId))
+        Dict.get executionId queryState.executionStates ?!= (\_ -> Debug.crash ("Cannot get executionState for queryId:" +-+ "(" ++ config.ownerPath ++ ")" +-+ queryId +-+ "executionId:" +-+ executionId))
 
 
-getNextExecutionId : Model mutation mutationState completionTagger msg -> ( Model mutation mutationState completionTagger msg, ExecutionId )
-getNextExecutionId model =
+getNextExecutionId : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> ( Model mutation mutationState completionTagger msg, ExecutionId )
+getNextExecutionId config model =
     let
         nextExecutionId =
             model.nextExecutionId + 1
 
         executionId =
-            model.fullyQualifiedModuleName ++ (toString nextExecutionId)
+            config.ownerPath ++ (toString nextExecutionId)
     in
         ( { model | nextExecutionId = nextExecutionId }, executionId )
 
@@ -324,17 +507,17 @@ getMaybeCurrentExecutionId queryId model =
     Dict.get queryId model.queryStates |?> .currentExecutionId ?= Nothing
 
 
-setExecutionState : QueryId -> ExecutionId -> Model mutation mutationState completionTagger msg -> ApiExecutionState mutationState -> Model mutation mutationState completionTagger msg
-setExecutionState queryId executionId model executionState =
+setExecutionState : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> ExecutionId -> ApiExecutionState mutationState -> Model mutation mutationState completionTagger msg
+setExecutionState config model queryId executionId executionState =
     let
         queryState =
-            getQueryState queryId model
+            getQueryState config model queryId
     in
         setQueryState queryId model { queryState | executionStates = Dict.insert executionId executionState queryState.executionStates }
 
 
-executeQuery : Config mutation mutationState completionTagger msg -> DbConnectionInfo -> Model mutation mutationState completionTagger msg -> Query (Msg mutation completionTagger) -> List EntityId -> Bool -> ( QueryId, ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) ) )
-executeQuery config dbConnectionInfo model query ids persist =
+executeQuery : Config mutation mutationState completionTagger msg -> DbConnectionInfo -> Model mutation mutationState completionTagger msg -> Query (Msg mutation completionTagger) -> List EntityId -> ( QueryId, ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) ) )
+executeQuery config dbConnectionInfo model query ids =
     let
         result =
             Engine.executeQuery (engineConfig config) dbConnectionInfo model.engineModel Nothing query ids
@@ -344,7 +527,7 @@ executeQuery config dbConnectionInfo model query ids persist =
                 (\( engineModel, cmd, queryId ) ->
                     ( queryId, { model | engineModel = engineModel } ! [ cmd ] )
                 )
-            ??= (\errors -> Debug.crash <| "Query error:" +-+ (String.join "\n" errors))
+            ??= (\errors -> Debug.crash <| "Query error:" +-+ "(" ++ config.ownerPath ++ ")" +-+ (String.join "\n" errors))
 
 
 refresh : Config mutation mutationState completionTagger msg -> DbConnectionInfo -> Model mutation mutationState completionTagger msg -> QueryId -> ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) )
@@ -354,23 +537,23 @@ refresh config dbConnectionInfo model queryId =
             (\( engineModel, cmd ) ->
                 let
                     queryState =
-                        getQueryState queryId model
+                        getQueryState config model queryId
                 in
                     { model | engineModel = engineModel } ! [ cmd ]
             )
-        ??= (\error -> Debug.crash <| "Refresh error:" +-+ error)
+        ??= (\error -> Debug.crash <| "Refresh error:" +-+ "(" ++ config.ownerPath ++ ")" +-+ error)
 
 
 findWatch : QueryId -> msg -> Model mutation mutationState completionTagger msg -> Maybe (Watch mutation mutationState completionTagger msg)
 findWatch queryId identityMsg model =
     (Dict.get queryId model.watches)
-        |?> List.find (\( msg, _, _, _ ) -> msg == identityMsg)
+        |?> List.find (\( msg, _, _ ) -> msg == identityMsg)
         ?= Nothing
 
 
-getDbConnectionInfo : Model mutation mutationState completionTagger msg -> DbConnectionInfo
-getDbConnectionInfo model =
-    model.dbConnectionInfo ?!= (\_ -> Debug.crash "Query not started")
+getDbConnectionInfo : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> DbConnectionInfo
+getDbConnectionInfo config model =
+    model.dbConnectionInfo ?!= (\_ -> Debug.crash ("Query not started" +-+ "(" ++ config.ownerPath ++ ")"))
 
 
 dbWatch :
@@ -378,13 +561,12 @@ dbWatch :
     -> Model mutation mutationState completionTagger msg
     -> List EntityEventTypes
     -> QueryId
-    -> ApiName
     -> FetchFunction mutation mutationState completionTagger msg
     -> (ApiQueryResultTagger payload error msg -> completionTagger)
     -> (QueryId -> ApiQueryResultTagger payload error msg)
     -> msg
     -> Result (List String) ( Model mutation mutationState completionTagger msg, Cmd msg )
-dbWatch config model queryEventTypes queryId apiName apiFetchFunction queryCompletionTagger completionTagger identityMsg =
+dbWatch config model queryEventTypes queryId apiFetchFunction queryCompletionTagger completionTagger identityMsg =
     let
         interceptedApiFetchFunction =
             (\model ->
@@ -397,17 +579,18 @@ dbWatch config model queryEventTypes queryId apiName apiFetchFunction queryCompl
     in
         findWatch queryId identityMsg model
             |?> (\_ -> Ok <| model ! [])
-            ?= (DbWatcher.subscribe (dbWatcherConfig config) (getDbConnectionInfo model) model.dbWatcherModel queryEventTypes queryId
+            ?= (DbWatcher.subscribe (dbWatcherConfig config) (getDbConnectionInfo config model) model.dbWatcherModel queryEventTypes queryId
                     |??>
                         (\( dbWatcherModel, dbWatcherCmd ) ->
-                            let
-                                watch =
-                                    ( identityMsg, apiName, Fetch interceptedApiFetchFunction, queryCompletionTagger (completionTagger queryId) ) :: (Dict.get queryId model.watches ?= [])
-
-                                watches =
-                                    Dict.insert queryId watch model.watches
-                            in
-                                { model | watches = watches, dbWatcherModel = dbWatcherModel } ! [ Cmd.map config.routeToMeTagger dbWatcherCmd ]
+                            { model
+                                | watches =
+                                    (Dict.insert queryId
+                                        (( identityMsg, Fetch interceptedApiFetchFunction, queryCompletionTagger (completionTagger queryId) ) :: (Dict.get queryId model.watches ?= []))
+                                        model.watches
+                                    )
+                                , dbWatcherModel = dbWatcherModel
+                            }
+                                ! [ Cmd.map config.routeToMeTagger dbWatcherCmd ]
                         )
                )
 
@@ -462,29 +645,29 @@ update config msg model =
                 updateEngine msg model
 
             EngineLog ( logLevel, ( queryId, message ) ) ->
-                ( model ! [], [ logMsg ("Engine:" +-+ ( queryId, message )) ] )
+                ( model ! [], [ logMsg ("Engine:" +-+ "(" ++ config.ownerPath ++ ")" +-+ ( queryId, message )) ] )
 
             EngineError ( errorType, ( queryId, error ) ) ->
                 let
                     queryState =
-                        getQueryState queryId model
+                        getQueryState config model queryId
                 in
-                    (queryComplete model queryId <| Err ( errorType, error ))
+                    (queryComplete config model queryId <| Err ( errorType, "Engine Error:" +-+ "(" ++ config.ownerPath ++ ")" +-+ error ))
                         |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
 
             DbWatcherMsg msg ->
                 updateDbWatcher msg model
 
             DbWatcherLog ( logLevel, details ) ->
-                ( model ! [], [ config.logTagger <| ( logLevel, "DbWatcher:" +-+ details ) ] )
+                ( model ! [], [ config.logTagger <| ( logLevel, "DbWatcher:" +-+ "(" ++ config.ownerPath ++ ")" +-+ details ) ] )
 
             DbWatcherError ( errorType, details ) ->
                 case errorType of
                     FatalError ->
-                        Debug.crash ("Fatal DbWatcherError:" +-+ details)
+                        Debug.crash ("Fatal DbWatcherError:" +-+ "(" ++ config.ownerPath ++ ")" +-+ details)
 
                     _ ->
-                        ( model ! [], [ config.errorTagger ( errorType, details ) ] )
+                        ( model ! [], [ config.errorTagger ( errorType, "(" ++ config.ownerPath ++ ")" +-+ details ) ] )
 
             DbWatcherRefreshRequired queryIds ->
                 let
@@ -493,7 +676,7 @@ update config msg model =
                             |> List.filterMap
                                 (\queryId ->
                                     Dict.get queryId model.watches
-                                        |?> List.map (\( _, _, fetchOperation, _ ) -> fetchOperation)
+                                        |?> List.map (\( _, fetchOperation, _ ) -> fetchOperation)
                                 )
                             |> List.concat
                             |> List.foldl
@@ -511,45 +694,41 @@ update config msg model =
                     ( newModel ! [], [ config.returnCmds cmds ] )
 
             UnspecifiedMutationInQuery queryId eventRecord ->
-                Debug.crash <| toString ( queryId, "UnspecifiedMutationInQuery:" +-+ eventRecord )
+                Debug.crash <| toString ( queryId, "UnspecifiedMutationInQuery:" +-+ "(" ++ config.ownerPath ++ ")" +-+ eventRecord )
 
             EventError eventRecord ( queryId, error ) ->
                 let
                     queryState =
-                        getQueryState queryId model
+                        getQueryState config model queryId
                 in
-                    (queryComplete model queryId <| Err ( NonFatalError, "EventError:" +-+ ( queryId, error ) +-+ "for eventRecord:" +-+ eventRecord ))
+                    (queryComplete config model queryId <| Err ( NonFatalError, "EventError:" +-+ "(" ++ config.ownerPath ++ ")" +-+ ( queryId, error ) +-+ "for eventRecord:" +-+ eventRecord ))
                         |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
 
             EventProcessingError ( eventStr, error ) ->
-                Debug.crash <| "Event Processing Error:" +-+ error +-+ "\nEvent:" +-+ eventStr
+                Debug.crash <| "Event Processing Error:" +-+ "(" ++ config.ownerPath ++ ")" +-+ error +-+ "\nEvent:" +-+ eventStr
 
             Mutate queryId mutation ->
-                config.onMutate model queryId mutation
+                config.onMutate (WrappedConfig config) model queryId mutation
                     |> (\( ( model, cmd ), msgs ) -> ( model ! [ cmd ], msgs ))
 
             EventProcessingComplete queryId ->
-                let
-                    queryState =
-                        getQueryState queryId model
-                in
-                    (queryComplete model queryId <| Ok ())
-                        |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
+                (queryComplete config model queryId <| Ok ())
+                    |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
 
             QueryCompleteEvent completionTagger queryId maybeProperties executionId ->
                 let
                     queryState =
-                        getQueryState queryId model
+                        getQueryState config model queryId
 
                     executionState =
-                        getExecutionState queryId executionId model
+                        getExecutionState config model queryId executionId
 
                     msg =
                         queryState.maybeError
                             |?> config.onError completionTagger
                             ?= config.onComplete executionState completionTagger maybeProperties
                 in
-                    ( countDownExecution model queryId executionId ! [], [ msg ] )
+                    ( countDownExecution config model queryId executionId ! [], [ msg ] )
 
 
 {-| subscriptions
@@ -564,9 +743,9 @@ subscriptions config model =
 
 {-| Get query state for speicified queryId
 -}
-getQueryState : QueryId -> Model mutation mutationState completionTagger msg -> ApiQueryState mutationState
-getQueryState queryId model =
-    getMaybeQueryState queryId model ?!= (\_ -> Debug.crash ("Cannot find queryState for queryId:" +-+ queryId))
+getQueryState : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> ApiQueryState mutationState
+getQueryState config model queryId =
+    getMaybeQueryState queryId model ?!= (\_ -> Debug.crash ("Cannot find queryState for queryId:" +-+ "(" ++ config.ownerPath ++ ")" +-+ queryId))
 
 
 {-| Set query state for speicified queryId
@@ -578,64 +757,64 @@ setQueryState queryId model queryState =
 
 {-| Get current execution id for specified queryId
 -}
-getCurrentExecutionId : QueryId -> Model mutation mutationState completionTagger msg -> ExecutionId
-getCurrentExecutionId queryId model =
-    getMaybeCurrentExecutionId queryId model ?!= (\_ -> Debug.crash ("Cannot get currentExecutionId for queryId:" +-+ queryId))
+getCurrentExecutionId : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> ExecutionId
+getCurrentExecutionId config model queryId =
+    getMaybeCurrentExecutionId queryId model ?!= (\_ -> Debug.crash ("Cannot get currentExecutionId for queryId:" +-+ "(" ++ config.ownerPath ++ ")" +-+ queryId))
 
 
 {-| Get current execution state for specified queryId
 -}
-getCurrentExecutionState : QueryId -> Model mutation mutationState completionTagger msg -> ApiExecutionState mutationState
-getCurrentExecutionState queryId model =
+getCurrentExecutionState : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> ApiExecutionState mutationState
+getCurrentExecutionState config model queryId =
     let
         executionId =
-            getCurrentExecutionId queryId model
+            getCurrentExecutionId config model queryId
     in
-        getExecutionState queryId executionId model
+        getExecutionState config model queryId executionId
 
 
 {-| Get current Entity MutationState for specified queryId
 -}
-getCurrentMutationState : QueryId -> Model mutation mutationState completionTagger msg -> mutationState
-getCurrentMutationState queryId model =
+getCurrentMutationState : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> mutationState
+getCurrentMutationState config model queryId =
     let
         executionId =
-            getCurrentExecutionId queryId model
+            getCurrentExecutionId config model queryId
     in
-        getExecutionState queryId executionId model
+        getExecutionState config model queryId executionId
             |> .mutationState
 
 
 {-| Set current Entity MutationState for specified queryId
 -}
-setCurrentMutationState : QueryId -> Model mutation mutationState completionTagger msg -> mutationState -> Model mutation mutationState completionTagger msg
-setCurrentMutationState queryId model mutationState =
+setCurrentMutationState : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> mutationState -> Model mutation mutationState completionTagger msg
+setCurrentMutationState config model queryId mutationState =
     let
         executionId =
-            getCurrentExecutionId queryId model
+            getCurrentExecutionId config model queryId
 
         executionState =
-            getExecutionState queryId executionId model
+            getExecutionState config model queryId executionId
     in
-        setExecutionState queryId executionId model { executionState | mutationState = mutationState }
+        setExecutionState config model queryId executionId { executionState | mutationState = mutationState }
 
 
 {-| Query is complete. N.B. this is called from APIs when a mutation error or some other error occurs.
     Otherwise this called automatically by this module when the query finishes.
 -}
-queryComplete : Model mutation mutationState completionTagger msg -> QueryId -> QueryResult -> ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) )
-queryComplete model queryId result =
-    let
-        queryState =
-            getQueryState queryId model
+queryComplete : Config mutation mutationState completionTagger msg -> Model mutation mutationState completionTagger msg -> QueryId -> QueryResult -> ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) )
+queryComplete config model queryId result =
+    getCurrentExecutionId config model queryId
+        |> (\currentExecutionId ->
+                let
+                    queryState =
+                        getQueryState config model queryId
 
-        currentExecutionId =
-            getCurrentExecutionId queryId model
-
-        maybeError =
-            result |??> always Nothing ??= Just
-    in
-        setQueryState queryId model { queryState | maybeError = maybeError, currentExecutionId = Nothing } ! [ EventEmitter.trigger currentExecutionId ]
+                    maybeError =
+                        result |??> always Nothing ??= Just
+                in
+                    setQueryState queryId model { queryState | maybeError = maybeError, currentExecutionId = Nothing } ! [ EventEmitter.trigger currentExecutionId ]
+           )
 
 
 {-| Query Result tagger
@@ -660,73 +839,94 @@ fetch :
     -> String
     -> ( QueryId, Model mutation mutationState completionTagger msg, Cmd msg )
 fetch query constructExecutionState config dbConnectionInfo model queryCompletionTagger completionTagger ids maybeProperties persist apiCallName =
-    let
-        listenerTagger =
-            queryCompletionTagger (completionTagger queryId)
-
-        ( queryId, ( model2, queryCmd ) ) =
-            let
-                initialFetch : Bool -> ( QueryId, ( Model mutation mutationState completionTagger msg, Cmd (Msg mutation completionTagger) ) )
-                initialFetch =
-                    executeQuery config dbConnectionInfo model query ids
-            in
-                Maybe.or (Dict.get apiCallName model.persitentQueryIds) model.refetchQueryId
-                    |?> (\queryId ->
-                            ( queryId
-                            , getMaybeCurrentExecutionId queryId model
-                                |?> always ( model, Cmd.none )
-                                ?= refresh config dbConnectionInfo model queryId
-                            )
+    (ids /= [] && persist)
+        ?! ( \_ -> Debug.crash ("Cannot persist query if ids specified" +-+ "(" ++ config.ownerPath ++ ")"), always "" )
+        |> (always
+                ((model.persistedEngineQueries
+                    |?> (\persistedEngineQueries ->
+                            (Dict.get apiCallName persistedEngineQueries)
+                                |?> (\json ->
+                                        Dict.remove apiCallName persistedEngineQueries
+                                            |> (\persistedEngineQueries ->
+                                                    Engine.importQueryState query model.engineModel json
+                                                        |??>
+                                                            (\( queryId, engineModel ) ->
+                                                                getNextExecutionId config model
+                                                                    |> (\( model, executionId ) ->
+                                                                            { persist = persist
+                                                                            , currentExecutionId = Nothing
+                                                                            , executionStates = Dict.empty
+                                                                            , maybeError = Nothing
+                                                                            }
+                                                                                |> setQueryState queryId (persist ? ( { model | persistentQueryIds = Dict.insert apiCallName queryId model.persistentQueryIds }, model ))
+                                                                                |> (\model -> ( { model | persistedEngineQueries = Just persistedEngineQueries, engineModel = engineModel }, Just queryId ))
+                                                                       )
+                                                            )
+                                                        ??= (\error ->
+                                                                config.debug
+                                                                    ? ( Debug.log ("*** DEBUG:SlateApi importQueryState for" +-+ "(" ++ config.ownerPath ++ ")" +-+ apiCallName) error, "" )
+                                                                    |> always ( model, Nothing )
+                                                            )
+                                               )
+                                    )
+                                ?= ( model, Nothing )
                         )
-                    ?= initialFetch persist
+                    ?= ( model, Nothing )
+                 )
+                    |> (\( model, maybePersistedQueryId ) ->
+                            (Maybe.or maybePersistedQueryId <| Maybe.or (Dict.get apiCallName model.persistentQueryIds) model.refetchQueryId)
+                                |?> (\queryId ->
+                                        ( queryId
+                                        , getMaybeCurrentExecutionId queryId model
+                                            |?> always ( model, Cmd.none )
+                                            ?= refresh config dbConnectionInfo model queryId
+                                        )
+                                    )
+                                ?= executeQuery config dbConnectionInfo model query ids
+                                |> (\( queryId, ( model, queryCmd ) ) ->
+                                        (getMaybeCurrentExecutionId queryId model
+                                            |?> (\executionId ->
+                                                    ( getQueryState config model queryId, getExecutionState config model queryId executionId )
+                                                        |> (\( queryState, executionState ) ->
+                                                                ( executionId
+                                                                , model
+                                                                , { queryState | executionStates = Dict.insert executionId { executionState | executionCount = executionState.executionCount + 1 } queryState.executionStates }
+                                                                )
+                                                           )
+                                                )
+                                            ?= (getNextExecutionId config model
+                                                    |> (\( model, executionId ) ->
+                                                            Dict.insert executionId (constructExecutionState ())
+                                                                |> (\executionStateToInsert ->
+                                                                        ( executionId
+                                                                        , model
+                                                                        , getMaybeQueryState queryId model
+                                                                            |?> (\queryState -> { queryState | executionStates = executionStateToInsert queryState.executionStates, currentExecutionId = Just executionId })
+                                                                            ?= { persist = persist
+                                                                               , currentExecutionId = Just executionId
+                                                                               , executionStates = executionStateToInsert Dict.empty
+                                                                               , maybeError = Nothing
+                                                                               }
+                                                                        )
+                                                                   )
+                                                       )
+                                               )
+                                        )
+                                            |> (\( executionId, model, queryState ) ->
+                                                    setQueryState queryId (persist ? ( { model | persistentQueryIds = Dict.insert apiCallName queryId model.persistentQueryIds }, model )) queryState
+                                                        |> (\model ->
+                                                                ( queryId, model, Cmd.map config.routeToMeTagger <| Cmd.batch [ queryCmd, EventEmitter.listenOnce (QueryCompleteEvent (queryCompletionTagger (completionTagger queryId)) queryId maybeProperties) executionId ] )
+                                                           )
+                                               )
+                                   )
+                       )
+                )
+           )
 
-        ( executionId, model3, newQueryState ) =
-            getMaybeCurrentExecutionId queryId model2
-                |?> (\executionId ->
-                        let
-                            queryState =
-                                getQueryState queryId model2
 
-                            executionState =
-                                getExecutionState queryId executionId model2
-                        in
-                            ( executionId, model2, { queryState | executionStates = Dict.insert executionId { executionState | executionCount = executionState.executionCount + 1 } queryState.executionStates } )
-                    )
-                ?= let
-                    maybeQueryState =
-                        getMaybeQueryState queryId model2
-
-                    ( model5, executionId ) =
-                        getNextExecutionId model2
-
-                    insertExectionState =
-                        Dict.insert executionId (constructExecutionState ())
-
-                    newQueryState =
-                        maybeQueryState
-                            |?> (\queryState ->
-                                    { queryState | executionStates = insertExectionState queryState.executionStates, currentExecutionId = Just executionId }
-                                )
-                            ?= { persist = persist
-                               , currentExecutionId = Just executionId
-                               , executionStates = insertExectionState Dict.empty
-                               , maybeError = Nothing
-                               }
-                   in
-                    ( executionId
-                    , model5
-                    , newQueryState
-                    )
-
-        model4 =
-            setQueryState queryId (persist ? ( { model3 | persitentQueryIds = Dict.insert apiCallName queryId model3.persitentQueryIds }, model3 )) newQueryState
-    in
-        ( queryId, model4, Cmd.map config.routeToMeTagger <| Cmd.batch [ queryCmd, EventEmitter.listenOnce (QueryCompleteEvent listenerTagger queryId maybeProperties) executionId ] )
-
-
-watchErrorCrash : List String -> x
-watchErrorCrash errors =
-    Debug.crash "Program bug: Watch Errors:" <| String.join "\n" errors
+watchErrorCrash : Config mutation mutationState completionTagger msg -> List String -> x
+watchErrorCrash config errors =
+    Debug.crash ("Program bug: Watch Errors:" +-+ "(" ++ config.ownerPath ++ ")" +-+ (String.join "\n" errors))
 
 
 {-| Fetch and Watch
@@ -734,20 +934,19 @@ watchErrorCrash errors =
 fetchAndWatch :
     Config mutation mutationState completionTagger msg
     -> Model mutation mutationState completionTagger msg
-    -> ApiName
     -> FetchFunction mutation mutationState completionTagger msg
     -> (ApiQueryResultTagger payload error msg -> completionTagger)
     -> (QueryId -> ApiQueryResultTagger payload error msg)
     -> msg
     -> FetchAndWatchFunctionReturn mutation mutationState completionTagger msg
-fetchAndWatch config model apiName apiFetchFunction queryCompletionTagger completionTagger identityMsg =
+fetchAndWatch config model apiFetchFunction queryCompletionTagger completionTagger identityMsg =
     apiFetchFunction model
         |> (\( query, ( queryId, model, fetchCmd ) ) ->
                 getQueryEventTypes query
                     |> (\queryEventTypes ->
-                            dbWatch config model queryEventTypes queryId apiName apiFetchFunction queryCompletionTagger completionTagger identityMsg
+                            dbWatch config model queryEventTypes queryId apiFetchFunction queryCompletionTagger completionTagger identityMsg
                                 |??> (\( model, watchCmd ) -> ( query, ( queryId, model, Cmd.batch [ fetchCmd, watchCmd ] ) ))
-                                ??= (\error -> ( query, ( queryId, model, sendParentUpdateMsg <| config.onError (queryCompletionTagger (completionTagger queryId)) ( NonFatalError, error +-+ "(QueryId:" +-+ queryId +-+ ")" ) ) ))
+                                ??= (\error -> ( query, ( queryId, model, sendParentUpdateMsg <| config.onError (queryCompletionTagger (completionTagger queryId)) ( NonFatalError, error +-+ "(QueryId:" +-+ queryId ++ ")" ) ) ))
                        )
            )
 
@@ -768,12 +967,12 @@ unwatch config model queryIds =
                             |> (\model ->
                                     getMaybeCurrentExecutionId queryId model
                                         |?> always model
-                                        ?= disposeQuery model queryId
+                                        ?= disposeQuery config model queryId
                                )
                             |> (\model ->
                                     DbWatcher.unsubscribe (dbWatcherConfig config) model.dbWatcherModel queryId
                                         |??> (\( dbWatcherModel, dbWatcherCmd ) -> ( model, Cmd.map config.routeToMeTagger dbWatcherCmd ))
-                                        ??= watchErrorCrash
+                                        ??= watchErrorCrash config
                                )
                       , ( model, Cmd.none )
                       )
@@ -788,10 +987,8 @@ unwatch config model queryIds =
 unwatchAll :
     Config mutation mutationState completionTagger msg
     -> Model mutation mutationState completionTagger msg
-    -> ApiName
     -> ( Model mutation mutationState completionTagger msg, Cmd msg )
-unwatchAll config model apiName =
+unwatchAll config model =
     model.watches
-        |> Dict.filter (\_ watches -> watches |> List.map (\( _, apiName, _, _ ) -> apiName) |> List.member apiName)
         |> Dict.keys
         |> unwatch config model
