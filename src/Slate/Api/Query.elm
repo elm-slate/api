@@ -67,6 +67,10 @@ import EventEmitter as EventEmitter
 import Utils.Error exposing (..)
 import Utils.Log exposing (..)
 import Utils.Ops exposing (..)
+import Utils.Dict exposing (..)
+
+
+-- import DebugF exposing (..)
 
 
 {-| Unique execution id for queries
@@ -209,7 +213,8 @@ type alias Model mutation mutationState completionTagger msg =
     , watches : Dict QueryId (List (Watch mutation mutationState completionTagger msg))
     , refetchQueryId : Maybe QueryId
     , dbConnectionInfo : Maybe DbConnectionInfo
-    , persistedEngineQueries : Maybe (Dict ApiCallName String)
+    , persistedEngineQueries : Dict ApiCallName String
+    , persistedApiQueryStates : Dict ApiCallName (ApiQueryState mutationState)
     }
 
 
@@ -264,7 +269,8 @@ initModel config =
           , watches = Dict.empty
           , refetchQueryId = Nothing
           , dbConnectionInfo = Nothing
-          , persistedEngineQueries = Nothing
+          , persistedEngineQueries = Dict.empty
+          , persistedApiQueryStates = Dict.empty
           }
         , [ engineCmd, dbWatcherCmd ]
         )
@@ -321,7 +327,7 @@ stop config model =
 -}
 type alias PersistedState mutationState =
     { engineQueries : Dict ApiCallName String
-    , apiQueryStates : Dict QueryId (ApiQueryState mutationState)
+    , apiQueryStates : Dict ApiCallName (ApiQueryState mutationState)
     }
 
 
@@ -358,7 +364,7 @@ persistedStateEncoder : (mutationState -> JE.Value) -> PersistedState mutationSt
 persistedStateEncoder mutationStateEncoder persistedState =
     JE.object
         [ ( "engineQueries", Json.encDict JE.string JE.string persistedState.engineQueries )
-        , ( "apiQueryStates", Json.encDict JE.int (queryStateEncoder mutationStateEncoder) persistedState.apiQueryStates )
+        , ( "apiQueryStates", Json.encDict JE.string (queryStateEncoder mutationStateEncoder) persistedState.apiQueryStates )
         ]
 
 
@@ -390,7 +396,7 @@ persistedStateDecoder : JD.Decoder mutationState -> JD.Decoder (PersistedState m
 persistedStateDecoder mutationStateDecoder =
     (JD.succeed PersistedState)
         <|| (field "engineQueries" <| Json.decDict JD.string JD.string)
-        <|| (field "apiQueryStates" <| Json.decDict JD.int (queryStateDecoder mutationStateDecoder))
+        <|| (field "apiQueryStates" <| Json.decDict JD.string (queryStateDecoder mutationStateDecoder))
 
 
 {-| Load persisted state
@@ -402,7 +408,7 @@ load :
     -> Result String (Model mutation mutationState completionTagger msg)
 load config model persistedState =
     enforceState LoadState model
-        |??> (\model -> Ok { model | persistedEngineQueries = Just persistedState.engineQueries })
+        |??> (\model -> Ok { model | persistedEngineQueries = persistedState.engineQueries, persistedApiQueryStates = persistedState.apiQueryStates })
         ??= Err
 
 
@@ -416,7 +422,7 @@ save config model =
     enforceState SaveState model
         |??>
             (\model ->
-                (model.persistentQueryIds
+                model.persistentQueryIds
                     |> Dict.filter (\_ -> Engine.isGoodQueryState model.engineModel)
                     |> Dict.map (\_ -> Engine.exportQueryState model.engineModel)
                     |> (\dict ->
@@ -425,15 +431,30 @@ save config model =
                                         model.queryStates
                                             |> Dict.filter (\_ -> .persist)
                                             |> Dict.map (\_ queryState -> { queryState | executionStates = Dict.map (\_ state -> { state | executionCount = 0 }) queryState.executionStates, currentExecutionId = Nothing, maybeError = Nothing })
-                                            |> (\apiQueryStates ->
-                                                    (Dict.size dictErrors == 0)
-                                                        ? ( Ok <| ( model, { engineQueries = Dict.map (\_ -> (flip (??=)) (always "")) dict, apiQueryStates = apiQueryStates } )
-                                                          , Err <| ((List.map ((flip (??=)) (always "")) <| Dict.values dictErrors) |> String.join "\n")
-                                                          )
+                                            |> (\queryStates ->
+                                                    swap model.persistentQueryIds
+                                                        |??>
+                                                            (\queryIdApiCallNameDict ->
+                                                                queryStates
+                                                                    |> Dict.toList
+                                                                    |> List.map
+                                                                        (\( queryId, apiQueryState ) ->
+                                                                            Dict.get queryId queryIdApiCallNameDict
+                                                                                |?> (\apiCallName -> ( apiCallName, apiQueryState ))
+                                                                                ?!= (\_ -> Debug.crash ("BUG: Cannot find queryId:" +-+ queryId +-+ "in queryIdApiCallNameDict:" +-+ queryIdApiCallNameDict))
+                                                                        )
+                                                                    |> Dict.fromList
+                                                                    |> (\apiQueryStates ->
+                                                                            (Dict.size dictErrors == 0)
+                                                                                ? ( Ok <| ( model, { engineQueries = Dict.map (\_ -> (flip (??=)) (always "")) dict, apiQueryStates = apiQueryStates } )
+                                                                                  , Err <| ((List.map ((flip (??=)) (always "")) <| Dict.values dictErrors) |> String.join "\n")
+                                                                                  )
+                                                                       )
+                                                            )
+                                                        ??= (\error -> Debug.crash ("BUG: model.persistentQueryIds swap error:" +-+ error))
                                                )
                                    )
                        )
-                )
             )
         ??= Err
 
@@ -464,14 +485,6 @@ countDownExecution config model queryId executionId =
     in
         queryState.persist
             ? ( setExecutionState config model queryId executionId { executionState | executionCount = executionState.executionCount - 1 }
-                -- let
-                --         executionCount =
-                --             executionState.executionCount - 1
-                --     in
-                --      (executionCount == 0)
-                --     ? ( setQueryState queryId model { queryState | executionStates = Dict.remove executionId queryState.executionStates }
-                --       , setExecutionState config model queryId executionId { executionState | executionCount = executionCount }
-                --       )
               , disposeQuery config model queryId
               )
 
@@ -842,37 +855,37 @@ fetch query constructExecutionState config dbConnectionInfo model queryCompletio
     (ids /= [] && persist)
         ?! ( \_ -> Debug.crash ("Cannot persist query if ids specified" +-+ "(" ++ config.ownerPath ++ ")"), always "" )
         |> (always
-                ((model.persistedEngineQueries
-                    |?> (\persistedEngineQueries ->
-                            (Dict.get apiCallName persistedEngineQueries)
-                                |?> (\json ->
-                                        Dict.remove apiCallName persistedEngineQueries
-                                            |> (\persistedEngineQueries ->
-                                                    Engine.importQueryState query model.engineModel json
-                                                        |??>
-                                                            (\( queryId, engineModel ) ->
-                                                                getNextExecutionId config model
-                                                                    |> (\( model, executionId ) ->
-                                                                            { persist = persist
-                                                                            , currentExecutionId = Nothing
-                                                                            , executionStates = Dict.empty
-                                                                            , maybeError = Nothing
-                                                                            }
-                                                                                |> setQueryState queryId (persist ? ( { model | persistentQueryIds = Dict.insert apiCallName queryId model.persistentQueryIds }, model ))
-                                                                                |> (\model -> ( { model | persistedEngineQueries = Just persistedEngineQueries, engineModel = engineModel }, Just queryId ))
+                (Dict.get apiCallName model.persistedEngineQueries
+                    |?> (\json ->
+                            Engine.importQueryState query model.engineModel json
+                                |??>
+                                    (\( queryId, engineModel ) ->
+                                        getNextExecutionId config model
+                                            |> (\( model, executionId ) ->
+                                                    Dict.get apiCallName model.persistedApiQueryStates
+                                                        |?> (\apiQueryState ->
+                                                                apiQueryState
+                                                                    |> setQueryState queryId (persist ? ( { model | persistentQueryIds = Dict.insert apiCallName queryId model.persistentQueryIds }, model ))
+                                                                    |> (\model ->
+                                                                            ( { model
+                                                                                | persistedEngineQueries = Dict.remove apiCallName model.persistedEngineQueries
+                                                                                , persistedApiQueryStates = Dict.remove apiCallName model.persistedApiQueryStates
+                                                                                , engineModel = engineModel
+                                                                              }
+                                                                            , Just queryId
+                                                                            )
                                                                        )
                                                             )
-                                                        ??= (\error ->
-                                                                config.debug
-                                                                    ? ( Debug.log ("*** DEBUG:SlateApi importQueryState for" +-+ "(" ++ config.ownerPath ++ ")" +-+ apiCallName) error, "" )
-                                                                    |> always ( model, Nothing )
-                                                            )
+                                                        ?!= (\_ -> Debug.crash ("BUG: Cannot find apiCallName:" +-+ apiCallName +-+ "in model.persistedApiQueryStates:" +-+ model.persistedApiQueryStates))
                                                )
                                     )
-                                ?= ( model, Nothing )
+                                ??= (\error ->
+                                        config.debug
+                                            ? ( Debug.log ("*** DEBUG:SlateApi importQueryState for" +-+ "(" ++ config.ownerPath ++ ")" +-+ apiCallName) error, "" )
+                                            |> always ( model, Nothing )
+                                    )
                         )
                     ?= ( model, Nothing )
-                 )
                     |> (\( model, maybePersistedQueryId ) ->
                             (Maybe.or maybePersistedQueryId <| Maybe.or (Dict.get apiCallName model.persistentQueryIds) model.refetchQueryId)
                                 |?> (\queryId ->
