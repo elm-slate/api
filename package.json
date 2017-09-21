@@ -1,0 +1,21 @@
+{
+  "name": "@elm-slate/api",
+  "version": "3.0.2",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elm-slate/api.git"
+  },
+  "author": "",
+  "license": "Unlicense",
+  "bugs": {
+    "url": "https://github.com/elm-slate/api/issues"
+  },
+  "homepage": "https://github.com/elm-slate/api#readme",
+"dependencies": {
+    "@elm-slate/command": "elm-stuff/grove/packages/elm-slate/command/installed",
+    "@elm-slate/dbwatcher": "elm-stuff/grove/packages/elm-slate/dbwatcher/installed"
+  }
+}
