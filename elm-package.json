@@ -1,5 +1,5 @@
 {
-    "version": "3.0.2",
+    "version": "3.0.3",
     "summary": "Slate Command and Query code for creating APIs",
     "repository": "https://github.com/elm-slate/api.git",
     "license": "Unlicense",
